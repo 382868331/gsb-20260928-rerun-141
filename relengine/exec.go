@@ -96,6 +96,27 @@ func (e *scanExec) Next(ctx context.Context) (*Batch, error) {
 
 func (e *scanExec) Close() error { return nil }
 
+type sliceSource struct {
+	rows []Tuple
+	pos  int
+	sz   int
+}
+
+func (s *sliceSource) Next(context.Context) (*Batch, error) {
+	if s.pos >= len(s.rows) {
+		return nil, io.EOF
+	}
+	end := s.pos + s.sz
+	if end > len(s.rows) {
+		end = len(s.rows)
+	}
+	b := &Batch{Rows: s.rows[s.pos:end]}
+	s.pos = end
+	return b, nil
+}
+
+func (s *sliceSource) Close() error { return nil }
+
 // ---- 过滤：逐批逐行，NULL/FALSE 都被丢弃 ----
 
 type filterExec struct {
@@ -234,9 +255,6 @@ type partitionReader struct {
 func (s *spiller) reader(part int) (*partitionReader, error) {
 	// 先关闭写句柄确保数据落盘，再以只读方式重新打开。
 	p := s.parts[part]
-	if err := p.f.Close(); err != nil {
-		return nil, err
-	}
 	f, err := os.Open(p.path)
 	if err != nil {
 		return nil, err
@@ -248,6 +266,9 @@ func (s *spiller) reader(part int) (*partitionReader, error) {
 func (r *partitionReader) next() ([]Tuple, error) {
 	var gb gobBatch
 	if err := r.dec.Decode(&gb); err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, fmt.Errorf("临时文件已损坏或被截断: %w", err)
+		}
 		return nil, err
 	}
 	return gb.Rows, nil

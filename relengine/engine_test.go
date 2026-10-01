@@ -230,3 +230,172 @@ func TestSpillAggregateAndCancellationCleanTempFiles(t *testing.T) {
 		t.Fatal("取消的查询应当返回错误")
 	}
 }
+
+func skewJoinPlan(orders, products *Table, jt JoinType) LogicalPlan {
+	on := Bin(OpEq, Col("o_sku"), Col("p_sku"))
+	return NewJoin(NewScan(orders, "o"), NewScan(products, "p"), on, jt)
+}
+
+func skewAggPlan(orders, products *Table, jt JoinType) LogicalPlan {
+	return NewAggregate(skewJoinPlan(orders, products, jt), nil,
+		[]*AggExpr{CountStar(), Count(Col("o_qty")), Sum(Col("o_qty"))})
+}
+
+func skewTables(t *testing.T) (*Table, *Table) {
+	t.Helper()
+	orders := NewTable("orders", ordersSchema())
+	for i := 1; i <= 40; i++ {
+		mustInsert(t, orders, Tuple{Str("A"), Int(int64(i))})
+	}
+	mustInsert(t, orders, Tuple{Str("B"), Int(41)})
+	mustInsert(t, orders, Tuple{NullValue(), NullValue()})
+
+	products := NewTable("products", productsSchema())
+	for i := 0; i < 8; i++ {
+		mustInsert(t, products, Tuple{Str("A")})
+	}
+	mustInsert(t, products, Tuple{Str("B")})
+	mustInsert(t, products, Tuple{Str("C")})
+	return orders, products
+}
+
+func TestSkewedJoinPlansAgreeAndKeepAggregates(t *testing.T) {
+	orders, products := skewTables(t)
+	wantRows := map[JoinType]int{InnerJoin: 321, LeftJoin: 322, RightJoin: 322}
+	wantAgg := map[JoinType]string{
+		InnerJoin: "321|321|6601",
+		LeftJoin:  "322|321|6601",
+		RightJoin: "322|321|6601",
+	}
+	for _, jt := range []JoinType{InnerJoin, LeftJoin, RightJoin} {
+		opts := ExecOptions{BatchRows: 1, MemRows: 1, TempDir: t.TempDir()}
+		hashExec, _ := buildPhysical(t, skewJoinPlan(orders, products, jt), opts, false)
+		first, err := hashExec.Next(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(first.Rows) != 1 {
+			t.Fatalf("%s 首批应只返回一行，得到 %d 行", jt, len(first.Rows))
+		}
+		hashRows := append([]Tuple{}, first.Rows...)
+		rest, err := Drain(context.Background(), hashExec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hashRows = append(hashRows, rest...)
+		nlExec, _ := buildPhysical(t, skewJoinPlan(orders, products, jt), opts, true)
+		firstNL, err := nlExec.Next(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(firstNL.Rows) != 1 {
+			t.Fatalf("%s NL 首批应只返回一行，得到 %d 行", jt, len(firstNL.Rows))
+		}
+		nlRows := append([]Tuple{}, firstNL.Rows...)
+		rest, err = Drain(context.Background(), nlExec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nlRows = append(nlRows, rest...)
+		if len(hashRows) != wantRows[jt] || len(nlRows) != wantRows[jt] {
+			t.Fatalf("%s 行数错误: hash=%d nl=%d want=%d", jt, len(hashRows), len(nlRows), wantRows[jt])
+		}
+		if got := canonical(hashRows); !equalStrings(got, canonical(nlRows)) {
+			t.Fatalf("%s Hash 与 NL 结果不一致\nhash=%v\nnl=%v", jt, got, canonical(nlRows))
+		}
+
+		hashAgg, _ := buildPhysical(t, skewAggPlan(orders, products, jt), opts, false)
+		hashAggRows, err := Drain(context.Background(), hashAgg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nlAgg, _ := buildPhysical(t, skewAggPlan(orders, products, jt), opts, true)
+		nlAggRows, err := Drain(context.Background(), nlAgg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := canonical(hashAggRows); len(got) != 1 || got[0] != wantAgg[jt] {
+			t.Fatalf("%s hash 聚合错误: got=%v want=%s", jt, got, wantAgg[jt])
+		}
+		if got := canonical(nlAggRows); len(got) != 1 || got[0] != wantAgg[jt] {
+			t.Fatalf("%s NL 聚合错误: got=%v want=%s", jt, got, wantAgg[jt])
+		}
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestJoinCancellationAndCorruptSpillCleanup(t *testing.T) {
+	orders, products := skewTables(t)
+	dir := t.TempDir()
+	opts := ExecOptions{BatchRows: 1, MemRows: 1, TempDir: dir}
+	executor, _ := buildPhysical(t, skewJoinPlan(orders, products, InnerJoin), opts, false)
+	if _, err := executor.Next(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := executor.Next(ctx); err == nil {
+		t.Fatal("取消后继续读取连接应返回错误")
+	}
+	if err := executor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("取消后临时目录未清理: %v", entries)
+	}
+
+	dir = t.TempDir()
+	opts.TempDir = dir
+	corrupt, _ := buildPhysical(t, skewJoinPlan(orders, products, InnerJoin), opts, false)
+	if _, err := corrupt.Next(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, "relengine-spill-*", "part-1.gob"))
+	if len(matches) != 1 {
+		t.Fatalf("未找到探测侧临时文件: %v", matches)
+	}
+	if err := os.WriteFile(matches[0], []byte("broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var readErr error
+	for {
+		_, readErr = corrupt.Next(context.Background())
+		if readErr != nil {
+			break
+		}
+	}
+	if readErr == nil {
+		t.Fatal("损坏临时文件应明确返回错误")
+	}
+	if err := corrupt.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("损坏文件错误后临时目录未清理: %v", entries)
+	}
+}
+
+func TestJoinSpillCreationFailureDoesNotFallbackToUnlimitedMemory(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orders, products := skewTables(t)
+	opts := ExecOptions{BatchRows: 1, MemRows: 1, TempDir: blocker}
+	executor, _ := buildPhysical(t, skewJoinPlan(orders, products, InnerJoin), opts, false)
+	defer executor.Close()
+	if _, err := executor.Next(context.Background()); err == nil {
+		t.Fatal("临时文件预算路径创建失败时应结束查询")
+	}
+}
