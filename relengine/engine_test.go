@@ -2,6 +2,9 @@ package relengine
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -229,4 +232,192 @@ func TestSpillAggregateAndCancellationCleanTempFiles(t *testing.T) {
 	if err == nil {
 		t.Fatal("取消的查询应当返回错误")
 	}
+}
+
+// 高倾斜 + 热键：左 40 行同键、右 60 行同键（多对多放大 2400 行），
+// 再混入 NULL 与不匹配键。MemRows=1 强制落盘，Hash 与 Nested Loop
+// 两种计划的返回行与聚合值必须完全一致。
+func TestSpillJoinHotKeyMatchesNestedLoop(t *testing.T) {
+	mkTables := func() (*Table, *Table) {
+		orders := NewTable("orders", ordersSchema())
+		products := NewTable("products", productsSchema())
+		for i := 0; i < 40; i++ {
+			mustInsert(t, orders, Tuple{Str("H"), Int(int64(i))})
+		}
+		mustInsert(t, orders, Tuple{NullValue(), Int(7)})
+		mustInsert(t, orders, Tuple{Str("Z"), Int(9)})
+		for i := 0; i < 60; i++ {
+			mustInsert(t, products, Tuple{Str("H")})
+		}
+		mustInsert(t, products, Tuple{Str("Y")})
+		return orders, products
+	}
+
+	opts := ExecOptions{BatchRows: 1, MemRows: 1, TempDir: t.TempDir()}
+	var got [2][]Tuple
+	for i, nl := range []bool{false, true} {
+		orders, products := mkTables()
+		plan := salesPlan(orders, products)
+		e, _ := buildPhysical(t, plan, opts, nl)
+		rows, err := Drain(context.Background(), e)
+		if err != nil {
+			t.Fatalf("nl=%v: %v", nl, err)
+		}
+		got[i] = rows
+	}
+	c1, c2 := canonical(got[0]), canonical(got[1])
+	if len(c1) != len(c2) {
+		t.Fatalf("分组数不一致\nhash=%v\nnl=%v", c1, c2)
+	}
+	for i := range c1 {
+		if c1[i] != c2[i] {
+			t.Fatalf("结果不一致\nhash=%v\nnl=%v", c1, c2)
+		}
+	}
+	// 热键组：COUNT(*)=2400，COUNT(o_qty)=2400，SUM(o_qty)=60*(0+...+39)=46800。
+	// INNER JOIN 下未匹配的 Y/Z/NULL 不产生分组。
+	want := []string{"H|2400|2400|46800"}
+	if len(c1) != 1 || c1[0] != want[0] {
+		t.Fatalf("聚合值不符: got %v want %v", c1, want)
+	}
+}
+
+// LEFT JOIN 落盘路径：未匹配左侧补 NULL，且每行只补一次。
+func TestSpillLeftJoinUnmatchedOnce(t *testing.T) {
+	orders := NewTable("orders", ordersSchema())
+	for i := 0; i < 10; i++ {
+		mustInsert(t, orders, Tuple{Str("A"), Int(1)})
+	}
+	for i := 0; i < 5; i++ {
+		mustInsert(t, orders, Tuple{Str("B"), Int(2)})
+	}
+	products := NewTable("products", productsSchema())
+	for i := 0; i < 3; i++ {
+		mustInsert(t, products, Tuple{Str("A")})
+	}
+	on := Bin(OpEq, Col("o_sku"), Col("p_sku"))
+	plan := NewJoin(NewScan(orders, "o"), NewScan(products, "p"), on, LeftJoin)
+	en := NewEngine(ExecOptions{BatchRows: 1, MemRows: 1, TempDir: t.TempDir()})
+	rows, _, err := en.Execute(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 10*3 匹配 + 5 行未匹配补 NULL = 35。
+	if len(rows) != 35 {
+		t.Fatalf("期望 35 行，得到 %d: %v", len(rows), canonical(rows))
+	}
+	nulls := 0
+	for _, row := range rows {
+		if row[2].Null {
+			nulls++
+		}
+	}
+	if nulls != 5 {
+		t.Fatalf("期望 5 行补 NULL，得到 %d", nulls)
+	}
+}
+
+func spillDirs(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, en := range entries {
+		out = append(out, en.Name())
+	}
+	return out
+}
+
+// 损坏的临时文件必须导致明确错误，且 Close 后临时目录被清理。
+func TestSpillJoinCorruptTempFileFailsAndCleansUp(t *testing.T) {
+	dir := t.TempDir()
+	orders := NewTable("orders", ordersSchema())
+	products := NewTable("products", productsSchema())
+	for i := 0; i < 20; i++ {
+		mustInsert(t, orders, Tuple{Str(fmt.Sprintf("k%d", i%3)), Int(int64(i))})
+		mustInsert(t, products, Tuple{Str(fmt.Sprintf("k%d", i%3))})
+	}
+	on := Bin(OpEq, Col("o_sku"), Col("p_sku"))
+	plan := NewJoin(NewScan(orders, "o"), NewScan(products, "p"), on, InnerJoin)
+	e, _ := buildPhysical(t, plan, ExecOptions{BatchRows: 1, MemRows: 1, TempDir: dir}, false)
+
+	ctx := context.Background()
+	if _, err := e.Next(ctx); err != nil {
+		t.Fatalf("首批应成功: %v", err)
+	}
+	names := spillDirs(t, dir)
+	if len(names) == 0 {
+		t.Fatal("落盘后应存在临时目录")
+	}
+	// 破坏所有分片文件。
+	for _, n := range names {
+		files, _ := os.ReadDir(filepath.Join(dir, n))
+		for _, f := range files {
+			p := filepath.Join(dir, n, f.Name())
+			if err := os.WriteFile(p, []byte("corrupted-gob-data"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	var runErr error
+	for runErr == nil {
+		_, runErr = e.Next(ctx)
+	}
+	if errors.Is(runErr, io.EOF) {
+		t.Fatal("损坏的临时文件不应被当作正常结束")
+	}
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close 应清理成功: %v", err)
+	}
+	if left := spillDirs(t, dir); len(left) != 0 {
+		t.Fatalf("临时目录未清理: %v", left)
+	}
+}
+
+// 取消发生在落盘回读中途：明确报错并清理临时文件。
+func TestSpillJoinCancelDuringReadback(t *testing.T) {
+	dir := t.TempDir()
+	orders := NewTable("orders", ordersSchema())
+	products := NewTable("products", productsSchema())
+	for i := 0; i < 30; i++ {
+		mustInsert(t, orders, Tuple{Str("A"), Int(1)})
+		mustInsert(t, products, Tuple{Str("A")})
+	}
+	on := Bin(OpEq, Col("o_sku"), Col("p_sku"))
+	plan := NewJoin(NewScan(orders, "o"), NewScan(products, "p"), on, InnerJoin)
+	e, _ := buildPhysical(t, plan, ExecOptions{BatchRows: 1, MemRows: 1, TempDir: dir}, false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if _, err := e.Next(ctx); err != nil {
+		t.Fatalf("首批应成功: %v", err)
+	}
+	cancel()
+	if _, err := e.Next(ctx); err == nil {
+		t.Fatal("取消后继续拉取应返回错误")
+	}
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close 应清理成功: %v", err)
+	}
+	if left := spillDirs(t, dir); len(left) != 0 {
+		t.Fatalf("临时目录未清理: %v", left)
+	}
+}
+
+// 预算不足必须明确报错，不能悄悄退回无限内存。
+func TestJoinInsufficientBudgetFails(t *testing.T) {
+	orders := NewTable("orders", ordersSchema())
+	mustInsert(t, orders, Tuple{Str("A"), Int(1)})
+	products := NewTable("products", productsSchema())
+	mustInsert(t, products, Tuple{Str("A")})
+	on := Bin(OpEq, Col("o_sku"), Col("p_sku"))
+	// 绕过 NewEngine 的默认值，直接构造零预算。
+	e, _ := buildPhysical(t, NewJoin(NewScan(orders, "o"), NewScan(products, "p"), on, InnerJoin),
+		ExecOptions{BatchRows: 0, MemRows: 0, TempDir: t.TempDir()}, false)
+	_, err := e.Next(context.Background())
+	if !errors.Is(err, ErrInsufficientBudget) {
+		t.Fatalf("期望 ErrInsufficientBudget，得到 %v", err)
+	}
+	_ = e.Close()
 }

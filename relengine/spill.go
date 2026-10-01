@@ -3,6 +3,7 @@ package relengine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -22,7 +23,22 @@ type hashJoinSpill struct {
 	spill     *spiller
 	partCount int
 	curPart   int
-	curJoin   Executor
+
+	// 回读状态：探测侧按 MemRows 分块驻留内存，构建侧按落盘批次流式重扫，
+	// 因此热键（单侧分片极大）也不会突破内存预算。
+	openPart  int
+	partOpen  bool
+	probeR    *partitionReader
+	probeBuf  []Tuple
+	probeEOF  bool
+	probeBlk  []Tuple
+	matched   []bool
+	buildR    *partitionReader
+	buildChk  []Tuple
+	buildPos  int
+	buildEOF  bool
+	unmatNext int
+	blkOpen   bool
 }
 
 func newHashJoinSpill(probe, build Executor, pending []Tuple, on Expr, jt JoinType,
@@ -40,8 +56,8 @@ func (e *hashJoinSpill) partBuild(p int) int { return p }
 func (e *hashJoinSpill) partProbe(p int) int { return e.partCount + p }
 
 func (e *hashJoinSpill) Close() error {
-	if e.curJoin != nil {
-		_ = e.curJoin.Close()
+	if e.spill == nil {
+		return nil
 	}
 	return e.spill.cleanup()
 }
@@ -85,6 +101,10 @@ func (e *hashJoinSpill) writeSide(ctx context.Context, src Executor, rows []Tupl
 }
 
 func (e *hashJoinSpill) prepare(ctx context.Context) error {
+	if e.opts.MemRows < 1 || e.opts.BatchRows < 1 {
+		return fmt.Errorf("%w: MemRows=%d BatchRows=%d",
+			ErrInsufficientBudget, e.opts.MemRows, e.opts.BatchRows)
+	}
 	s, err := newSpiller(e.opts.TempDir, e.partCount*2)
 	if err != nil {
 		return err
@@ -99,6 +119,83 @@ func (e *hashJoinSpill) prepare(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func (e *hashJoinSpill) combine(probe, build Tuple) Tuple {
+	if e.probeLeft {
+		return append(append(Tuple{}, probe...), build...)
+	}
+	return append(append(Tuple{}, build...), probe...)
+}
+
+func (e *hashJoinSpill) unmatched(probe Tuple) Tuple {
+	if e.probeLeft {
+		return append(append(Tuple{}, probe...), nullRow(e.rn)...)
+	}
+	return append(append(Tuple{}, nullRow(e.ln)...), probe...)
+}
+
+// nextBlock 载入下一块探测侧行（至多 MemRows 行），必要时前进到下一个分片。
+// 返回 false 表示所有分片都已耗尽。
+func (e *hashJoinSpill) nextBlock(ctx context.Context) (bool, error) {
+	limit := e.opts.MemRows
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if !e.partOpen {
+			if e.curPart >= e.partCount {
+				return false, nil
+			}
+			pr, err := e.spill.reader(e.partProbe(e.curPart))
+			if err != nil {
+				return false, err
+			}
+			e.probeR = pr
+			e.probeBuf = e.probeBuf[:0]
+			e.probeEOF = false
+			e.openPart = e.curPart
+			e.curPart++
+			e.partOpen = true
+		}
+		for len(e.probeBuf) < limit && !e.probeEOF {
+			chunk, err := e.probeR.next()
+			if errors.Is(err, io.EOF) {
+				e.probeEOF = true
+				break
+			}
+			if err != nil {
+				return false, err
+			}
+			e.probeBuf = append(e.probeBuf, chunk...)
+		}
+		if len(e.probeBuf) == 0 {
+			// 当前分片探测侧为空，推进到下一分片。
+			e.partOpen = false
+			e.probeR = nil
+			continue
+		}
+		n := limit
+		if n > len(e.probeBuf) {
+			n = len(e.probeBuf)
+		}
+		blk := make([]Tuple, n)
+		copy(blk, e.probeBuf[:n])
+		e.probeBuf = append(e.probeBuf[:0], e.probeBuf[n:]...)
+		e.probeBlk = blk
+		e.matched = make([]bool, n)
+		br, err := e.spill.reader(e.partBuild(e.openPart))
+		if err != nil {
+			return false, err
+		}
+		e.buildR = br
+		e.buildChk = nil
+		e.buildPos = 0
+		e.buildEOF = false
+		e.unmatNext = 0
+		e.blkOpen = true
+		return true, nil
+	}
 }
 
 type sliceSource struct {
@@ -125,70 +222,79 @@ func (s *sliceSource) Next(ctx context.Context) (*Batch, error) {
 
 func (s *sliceSource) Close() error { return nil }
 
-func (e *hashJoinSpill) readPart(part int) (probe, build []Tuple, err error) {
-	br, err := e.spill.reader(e.partBuild(part))
-	if err != nil {
-		return nil, nil, err
-	}
-	for {
-		got, err := br.next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return nil, nil, err
-		}
-		build = append(build, got...)
-	}
-	pr, err := e.spill.reader(e.partProbe(part))
-	if err != nil {
-		return nil, nil, err
-	}
-	for {
-		got, err := pr.next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return nil, nil, err
-		}
-		probe = append(probe, got...)
-	}
-	return probe, build, nil
-}
-
+// Next 逐批产出连接结果。探测侧每次只驻留一块（<= MemRows 行），
+// 构建侧分片按落盘批次流式扫描；块内每一行都与整片构建侧比较，
+// 因此热键的多对多放大结果完整，且内存不随分片大小增长。
 func (e *hashJoinSpill) Next(ctx context.Context) (*Batch, error) {
 	if e.spill == nil {
 		if err := e.prepare(ctx); err != nil {
 			return nil, err
 		}
 	}
-	for {
+	sz := e.opts.BatchRows
+	out := &Batch{}
+	for len(out.Rows) < sz {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if e.curJoin == nil {
-			if e.curPart >= e.partCount {
-				return nil, io.EOF
-			}
-			probe, build, err := e.readPart(e.curPart)
+		if !e.blkOpen {
+			ok, err := e.nextBlock(ctx)
 			if err != nil {
 				return nil, err
 			}
-			e.curPart++
-			src := &sliceSource{rows: probe, sz: e.opts.BatchRows}
-			e.curJoin = newMemHashJoin(src, build, e.on, e.jt, e.ln, e.rn,
-				e.probeEq, e.buildEq, e.probeLeft, e.opts.BatchRows)
+			if !ok {
+				if len(out.Rows) > 0 {
+					return out, nil
+				}
+				return nil, io.EOF
+			}
 		}
-		b, err := e.curJoin.Next(ctx)
-		if errors.Is(err, io.EOF) {
-			_ = e.curJoin.Close()
-			e.curJoin = nil
+		if !e.buildEOF {
+			if e.buildPos >= len(e.buildChk) {
+				chunk, err := e.buildR.next()
+				if errors.Is(err, io.EOF) {
+					e.buildEOF = true
+					e.buildChk = nil
+					continue
+				}
+				if err != nil {
+					return nil, err
+				}
+				e.buildChk = chunk
+				e.buildPos = 0
+				if len(chunk) == 0 {
+					continue
+				}
+			}
+			build := e.buildChk[e.buildPos]
+			e.buildPos++
+			for i, probe := range e.probeBlk {
+				combined := e.combine(probe, build)
+				v, err := e.on.Eval(combined)
+				if err != nil {
+					return nil, err
+				}
+				if v.IsTruthy() {
+					e.matched[i] = true
+					out.Rows = append(out.Rows, combined)
+					if len(out.Rows) >= sz {
+						return out, nil
+					}
+				}
+			}
 			continue
 		}
-		if err != nil {
-			return nil, err
+		// 构建侧整片扫完：外连接为未匹配的探测行补 NULL，然后换下一块。
+		for e.unmatNext < len(e.probeBlk) && len(out.Rows) < sz {
+			i := e.unmatNext
+			e.unmatNext++
+			if !e.matched[i] && (e.jt == LeftJoin || e.jt == RightJoin) {
+				out.Rows = append(out.Rows, e.unmatched(e.probeBlk[i]))
+			}
 		}
-		return b, nil
+		if e.unmatNext >= len(e.probeBlk) {
+			e.blkOpen = false
+		}
 	}
+	return out, nil
 }

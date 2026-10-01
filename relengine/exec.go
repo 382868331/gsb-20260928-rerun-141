@@ -49,6 +49,10 @@ type Executor interface {
 	Close() error
 }
 
+// ErrInsufficientBudget 表示内存/批大小预算小到无法保证有界执行。
+// 引擎返回该错误而不是悄悄退回无限内存。
+var ErrInsufficientBudget = errors.New("relengine: 内存预算不足")
+
 // Drain 把执行器结果全部收集到内存（测试与小结果集使用）。
 func Drain(ctx context.Context, e Executor) ([]Tuple, error) {
 	defer e.Close()

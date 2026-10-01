@@ -3,6 +3,7 @@ package relengine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -65,6 +66,10 @@ func (e *joinExec) Close() error {
 }
 
 func (e *joinExec) prepare(ctx context.Context) error {
+	if e.opts.MemRows < 1 || e.opts.BatchRows < 1 {
+		return fmt.Errorf("%w: MemRows=%d BatchRows=%d",
+			ErrInsufficientBudget, e.opts.MemRows, e.opts.BatchRows)
+	}
 	leftEq, rightEq := eqJoinKeys(e.on, e.ln)
 	if e.jt == LeftJoin {
 		b, err := collectLimited(ctx, e.r, e.opts.MemRows)
