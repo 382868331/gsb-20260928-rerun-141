@@ -9,19 +9,28 @@ import (
 // 调用方直接组合逻辑计划；这保证测试可以构造任意多棵计划树，而不是一条写死查询。
 type Engine struct {
 	opts ExecOptions
+	pool *MemPool
 }
 
 func NewEngine(opts ExecOptions) *Engine {
 	return &Engine{opts: opts.withDefaults()}
 }
 
+// Pool 返回最近一次 Execute 使用的内存池（用于核对实际占用）。
+func (en *Engine) Pool() *MemPool { return en.pool }
+
 // Execute 绑定计划并执行，返回全部结果行。
 func (en *Engine) Execute(ctx context.Context, plan LogicalPlan) ([]Tuple, *Schema, error) {
+	opts := en.opts
+	if opts.Pool == nil {
+		opts.Pool = NewMemPool(opts.MemRows)
+	}
+	en.pool = opts.Pool
 	schema, err := plan.Bind()
 	if err != nil {
 		return nil, nil, err
 	}
-	exec, err := en.build(plan)
+	exec, err := en.buildWith(plan, opts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -33,38 +42,42 @@ func (en *Engine) Execute(ctx context.Context, plan LogicalPlan) ([]Tuple, *Sche
 }
 
 func (en *Engine) build(plan LogicalPlan) (Executor, error) {
+	return en.buildWith(plan, en.opts)
+}
+
+func (en *Engine) buildWith(plan LogicalPlan, opts ExecOptions) (Executor, error) {
 	switch p := plan.(type) {
 	case *Scan:
-		return &scanExec{tbl: p.Table, sz: en.opts.BatchRows}, nil
+		return &scanExec{tbl: p.Table, sz: opts.BatchRows}, nil
 	case *Filter:
-		child, err := en.build(p.Child)
+		child, err := en.buildWith(p.Child, opts)
 		if err != nil {
 			return nil, err
 		}
-		return &filterExec{child: child, cond: p.Cond, sz: en.opts.BatchRows}, nil
+		return &filterExec{child: child, cond: p.Cond, sz: opts.BatchRows}, nil
 	case *Project:
-		child, err := en.build(p.Child)
+		child, err := en.buildWith(p.Child, opts)
 		if err != nil {
 			return nil, err
 		}
 		return &projectExec{child: child, items: p.Items}, nil
 	case *Join:
-		left, err := en.build(p.L)
+		left, err := en.buildWith(p.L, opts)
 		if err != nil {
 			return nil, err
 		}
-		right, err := en.build(p.R)
+		right, err := en.buildWith(p.R, opts)
 		if err != nil {
 			return nil, err
 		}
 		return BuildJoin(left, right, p.On, p.Type,
-			len(p.L.Schema().Cols), len(p.R.Schema().Cols), en.opts), nil
+			len(p.L.Schema().Cols), len(p.R.Schema().Cols), opts), nil
 	case *Aggregate:
-		child, err := en.build(p.Child)
+		child, err := en.buildWith(p.Child, opts)
 		if err != nil {
 			return nil, err
 		}
-		return BuildAggregate(child, p, en.opts, en.opts.SpillAggregate)
+		return BuildAggregate(child, p, opts, opts.SpillAggregate)
 	default:
 		return nil, fmt.Errorf("未知逻辑计划节点 %T", plan)
 	}

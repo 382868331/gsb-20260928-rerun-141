@@ -49,6 +49,7 @@ type joinExec struct {
 	opts     ExecOptions
 	prepared bool
 	inner    Executor
+	grant    int // 已向 Pool 申请、尚未归还的行额度
 }
 
 func BuildJoin(l, r Executor, on Expr, jt JoinType, ln, rn int, opts ExecOptions) Executor {
@@ -56,6 +57,10 @@ func BuildJoin(l, r Executor, on Expr, jt JoinType, ln, rn int, opts ExecOptions
 }
 
 func (e *joinExec) Close() error {
+	if e.opts.Pool != nil && e.grant > 0 {
+		e.opts.Pool.Release(e.grant)
+		e.grant = 0
+	}
 	if e.inner != nil {
 		_ = e.inner.Close()
 	}
@@ -65,43 +70,93 @@ func (e *joinExec) Close() error {
 	return e.r.Close()
 }
 
+// acquire 从共享池申请构建侧额度；无池时退化为完整 MemRows。
+func (e *joinExec) acquire() int {
+	limit := e.opts.MemRows
+	if e.opts.Pool == nil {
+		return limit
+	}
+	e.grant = e.opts.Pool.Acquire(limit)
+	return e.grant
+}
+
+// MemUsage 报告当前在内存中保留的行数（构建侧物化 + 回读块）。
+func (e *joinExec) MemUsage() int {
+	switch in := e.inner.(type) {
+	case *memHashJoin:
+		return in.MemUsage()
+	case *hashJoinSpill:
+		return in.MemUsage()
+	}
+	return 0
+}
+
 func (e *joinExec) prepare(ctx context.Context) error {
 	if e.opts.MemRows < 1 || e.opts.BatchRows < 1 {
 		return fmt.Errorf("%w: MemRows=%d BatchRows=%d",
 			ErrInsufficientBudget, e.opts.MemRows, e.opts.BatchRows)
 	}
 	leftEq, rightEq := eqJoinKeys(e.on, e.ln)
+	limit := e.acquire()
+	spill := func(probe, build Executor, pending []Tuple, probeEq, buildEq []int, probeLeft bool) {
+		// 构建侧超出授予额度：归还预留，回读阶段只保留 1 行探测块。
+		keep := 1
+		if e.grant < 1 {
+			keep = 0 // 池已耗尽：1 行块作为未计额的最小 I/O 缓冲
+		}
+		if e.opts.Pool != nil {
+			e.opts.Pool.Release(e.grant - keep)
+			e.opts.Pool.NoteSpill(
+				"连接构建侧超过授予额度 %d 行（池剩余不足），转入临时存储", e.grant)
+		}
+		e.grant = keep
+		memRows := keep
+		if memRows < 1 {
+			memRows = 1
+		}
+		e.inner = newHashJoinSpill(probe, build, pending, e.on, e.jt, e.ln, e.rn,
+			probeEq, buildEq, probeLeft, e.opts, memRows)
+	}
+	mem := func(probe Executor, rows []Tuple, probeEq, buildEq []int, probeLeft bool) {
+		// 实际持有 len(rows)，归还多余预留。
+		if e.opts.Pool != nil && len(rows) < e.grant {
+			e.opts.Pool.Release(e.grant - len(rows))
+			e.grant = len(rows)
+		}
+		e.inner = newMemHashJoin(probe, rows, e.on, e.jt, e.ln, e.rn,
+			probeEq, buildEq, probeLeft, e.opts.BatchRows)
+	}
 	if e.jt == LeftJoin {
-		b, err := collectLimited(ctx, e.r, e.opts.MemRows)
+		b, err := collectLimited(ctx, e.r, limit)
 		if err != nil {
 			return err
 		}
 		if b.spilled {
-			e.inner = newHashJoinSpill(e.l, e.r, b.pending, e.on, e.jt, e.ln, e.rn,
-				leftEq, rightEq, true, e.opts)
+			spill(e.l, e.r, b.pending, leftEq, rightEq, true)
 			return nil
 		}
-		e.inner = newMemHashJoin(e.l, b.rows, e.on, e.jt, e.ln, e.rn,
-			leftEq, rightEq, true, e.opts.BatchRows)
+		mem(e.l, b.rows, leftEq, rightEq, true)
 		return nil
 	}
-	b, err := collectLimited(ctx, e.l, e.opts.MemRows)
+	b, err := collectLimited(ctx, e.l, limit)
 	if err != nil {
 		return err
 	}
 	if b.spilled {
-		e.inner = newHashJoinSpill(e.r, e.l, b.pending, e.on, e.jt, e.ln, e.rn,
-			rightEq, leftEq, false, e.opts)
+		spill(e.r, e.l, b.pending, rightEq, leftEq, false)
 		return nil
 	}
-	e.inner = newMemHashJoin(e.r, b.rows, e.on, e.jt, e.ln, e.rn,
-		rightEq, leftEq, false, e.opts.BatchRows)
+	mem(e.r, b.rows, rightEq, leftEq, false)
 	return nil
 }
 
 func (e *joinExec) Next(ctx context.Context) (*Batch, error) {
 	if !e.prepared {
 		if err := e.prepare(ctx); err != nil {
+			if e.opts.Pool != nil && e.grant > 0 {
+				e.opts.Pool.Release(e.grant)
+				e.grant = 0
+			}
 			if e.inner != nil {
 				_ = e.inner.Close()
 			}
@@ -145,6 +200,7 @@ type memHashJoin struct {
 	probe        Executor
 	ht           map[string][]Tuple
 	allBuild     []Tuple
+	buildRows    int
 	on           Expr
 	jt           JoinType
 	ln, rn       int
@@ -163,7 +219,8 @@ type memHashJoin struct {
 func newMemHashJoin(probe Executor, build []Tuple, on Expr, jt JoinType, ln, rn int,
 	probeEq, buildEq []int, probeLeft bool, sz int) *memHashJoin {
 	m := &memHashJoin{probe: probe, on: on, jt: jt, ln: ln, rn: rn,
-		probeEq: probeEq, buildEq: buildEq, probeLeft: probeLeft, sz: sz}
+		probeEq: probeEq, buildEq: buildEq, probeLeft: probeLeft, sz: sz,
+		buildRows: len(build)}
 	if len(buildEq) == 0 {
 		m.allBuild = build
 		return m
@@ -177,6 +234,15 @@ func newMemHashJoin(probe Executor, build []Tuple, on Expr, jt JoinType, ln, rn 
 }
 
 func (m *memHashJoin) Close() error { return m.probe.Close() }
+
+// MemUsage 报告当前内存占用：构建侧物化行 + 当前探测批次。
+func (m *memHashJoin) MemUsage() int {
+	n := m.buildRows
+	if m.probeBatch != nil {
+		n += len(m.probeBatch.Rows)
+	}
+	return n
+}
 
 func (m *memHashJoin) combine(probe, build Tuple) Tuple {
 	if m.probeLeft {

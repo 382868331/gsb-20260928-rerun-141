@@ -19,6 +19,7 @@ type hashJoinSpill struct {
 	buildEq      []int
 	probeLeft    bool
 	opts         ExecOptions
+	memRows      int // 探测侧驻留内存的行数上限（来自 Pool 授予额度）
 
 	spill     *spiller
 	partCount int
@@ -42,14 +43,22 @@ type hashJoinSpill struct {
 }
 
 func newHashJoinSpill(probe, build Executor, pending []Tuple, on Expr, jt JoinType,
-	ln, rn int, probeEq, buildEq []int, probeLeft bool, opts ExecOptions) *hashJoinSpill {
+	ln, rn int, probeEq, buildEq []int, probeLeft bool, opts ExecOptions, memRows int) *hashJoinSpill {
 	parts := 4
 	if len(probeEq) == 0 {
 		parts = 1
 	}
+	if memRows < 1 {
+		memRows = 1
+	}
 	return &hashJoinSpill{probe: probe, build: build, pendingBuild: pending, on: on,
 		jt: jt, ln: ln, rn: rn, probeEq: probeEq, buildEq: buildEq,
-		probeLeft: probeLeft, opts: opts, partCount: parts}
+		probeLeft: probeLeft, opts: opts, partCount: parts, memRows: memRows}
+}
+
+// MemUsage 报告当前内存占用：驻留的探测块（<= memRows）加缓冲中的行。
+func (e *hashJoinSpill) MemUsage() int {
+	return len(e.probeBlk) + len(e.probeBuf) + len(e.buildChk)
 }
 
 func (e *hashJoinSpill) partBuild(p int) int { return p }
@@ -101,7 +110,7 @@ func (e *hashJoinSpill) writeSide(ctx context.Context, src Executor, rows []Tupl
 }
 
 func (e *hashJoinSpill) prepare(ctx context.Context) error {
-	if e.opts.MemRows < 1 || e.opts.BatchRows < 1 {
+	if e.opts.BatchRows < 1 {
 		return fmt.Errorf("%w: MemRows=%d BatchRows=%d",
 			ErrInsufficientBudget, e.opts.MemRows, e.opts.BatchRows)
 	}
@@ -138,7 +147,7 @@ func (e *hashJoinSpill) unmatched(probe Tuple) Tuple {
 // nextBlock 载入下一块探测侧行（至多 MemRows 行），必要时前进到下一个分片。
 // 返回 false 表示所有分片都已耗尽。
 func (e *hashJoinSpill) nextBlock(ctx context.Context) (bool, error) {
-	limit := e.opts.MemRows
+	limit := e.memRows
 	for {
 		if err := ctx.Err(); err != nil {
 			return false, err
