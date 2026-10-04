@@ -2,8 +2,12 @@ package relengine
 
 import (
 	"context"
+	"errors"
+	"io"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type usageReporter interface{ MemUsage() int }
@@ -290,4 +294,222 @@ func TestSkewAndCrossJoinUnderBudget(t *testing.T) {
 			}
 		}
 	}
+}
+
+// 极小总额度（3 行）下两个连接阶段共享一份预算：逐批核对每个阶段的
+// 常驻行都计入额度、授予总额与池内记账一致，结束后全部归还。
+func TestTinyPoolMultiJoinLedger(t *testing.T) {
+	mk := func() (*Table, *Table, *Table) {
+		a := NewTable("a", kvSchema())
+		b := NewTable("b", kvSchema())
+		c := NewTable("c", kvSchema())
+		for i := 0; i < 2; i++ {
+			mustInsert(t, a, Tuple{Str("x"), Int(int64(i))})
+			mustInsert(t, b, Tuple{Str("x"), Int(int64(i + 10))})
+		}
+		for i := 0; i < 3; i++ {
+			mustInsert(t, c, Tuple{Str("x"), Int(int64(i + 20))})
+		}
+		return a, b, c
+	}
+	planOf := func() LogicalPlan {
+		a, b, c := mk()
+		inner := NewJoin(NewScan(a, "a"), NewScan(b, "b"),
+			Bin(OpEq, Col("a.k"), Col("b.k")), InnerJoin)
+		return NewJoin(inner, NewScan(c, "c"),
+			Bin(OpEq, Col("a.k"), Col("c.k")), InnerJoin)
+	}
+	ref, _, err := NewEngine(ExecOptions{BatchRows: 2, MemRows: 4096, TempDir: t.TempDir()}).
+		Execute(context.Background(), planOf())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ref) != 12 { // 2*2*3
+		t.Fatalf("参照结果应为 12 行，得到 %d", len(ref))
+	}
+
+	pool := NewMemPool(3)
+	a, b, c := mk()
+	innerPlan := NewJoin(NewScan(a, "a"), NewScan(b, "b"),
+		Bin(OpEq, Col("a.k"), Col("b.k")), InnerJoin)
+	plan := NewJoin(innerPlan, NewScan(c, "c"),
+		Bin(OpEq, Col("a.k"), Col("c.k")), InnerJoin)
+	e, _ := buildPhysical(t, plan, ExecOptions{BatchRows: 2, MemRows: 3, TempDir: t.TempDir(), Pool: pool}, false)
+	outer := e.(*joinExec)
+
+	ctx := context.Background()
+	var got []Tuple
+	for {
+		batch, err := e.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, batch.Rows...)
+		// 每个阶段常驻行都必须落在自己的授予额度内。
+		inner := outer.l.(*joinExec)
+		switch in := inner.inner.(type) {
+		case *memHashJoin:
+			if in.buildRows != inner.grant {
+				t.Fatalf("内层连接常驻 %d 行，授予 %d 行", in.buildRows, inner.grant)
+			}
+		}
+		if sp, ok := outer.inner.(*hashJoinSpill); ok {
+			if len(sp.probeBlk) > outer.grant {
+				t.Fatalf("外层探测块 %d 行超出授予 %d 行", len(sp.probeBlk), outer.grant)
+			}
+		}
+		// 池内记账必须等于各阶段授予之和（占用与记账一致）。
+		st := pool.Stats()
+		if want := inner.grant + outer.grant; st.InUse != want {
+			t.Fatalf("池记账 %d 行，各阶段授予合计 %d 行", st.InUse, want)
+		}
+		if st.Peak > st.Total {
+			t.Fatalf("峰值 %d 超过池上限 %d", st.Peak, st.Total)
+		}
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	g1, g2 := canonical(got), canonical(ref)
+	if len(g1) != len(g2) {
+		t.Fatalf("极小池结果行数不符: got %d want %d", len(g1), len(g2))
+	}
+	for i := range g1 {
+		if g1[i] != g2[i] {
+			t.Fatalf("极小池结果不一致\ngot=%v\nwant=%v", g1, g2)
+		}
+	}
+	st := pool.Stats()
+	if st.InUse != 0 {
+		t.Fatalf("结束后额度应全部归还，仍占用 %d 行", st.InUse)
+	}
+	if st.Peak != st.Total {
+		t.Fatalf("极小池应被用满到上限 %d，峰值 %d", st.Total, st.Peak)
+	}
+	if st.Spills == 0 || len(st.Events) == 0 {
+		t.Fatalf("额度不足应落盘并记录原因: %+v", st)
+	}
+	t.Logf("占用/等待/释放事件: %v", st.Events)
+}
+
+// 多层连接耗尽共享额度：外层已占满池时，内层不能再靠一行未计额
+// 探测缓冲硬撑，必须返回可解释的预算不足；所属查询释放额度后，
+// 独立查询不受影响。
+func TestSharedPoolExhaustionFailsExplainably(t *testing.T) {
+	dir := t.TempDir()
+	mk := func() (*Table, *Table, *Table) {
+		a := NewTable("a", kvSchema())
+		b := NewTable("b", kvSchema())
+		c := NewTable("c", kvSchema())
+		for i := 0; i < 3; i++ {
+			mustInsert(t, a, Tuple{Str("x"), Int(int64(i))})
+			mustInsert(t, b, Tuple{Str("x"), Int(int64(i + 10))})
+			mustInsert(t, c, Tuple{Str("x"), Int(int64(i + 20))})
+		}
+		return a, b, c
+	}
+	a, b, c := mk()
+	innerPlan := NewJoin(NewScan(a, "a"), NewScan(b, "b"),
+		Bin(OpEq, Col("a.k"), Col("b.k")), InnerJoin)
+	plan := NewJoin(innerPlan, NewScan(c, "c"),
+		Bin(OpEq, Col("a.k"), Col("c.k")), InnerJoin)
+	// 内层先占满 3 行额度，外层连 1 行探测块都申请不到。
+	pool := NewMemPool(3)
+	_, _, err := NewEngine(ExecOptions{BatchRows: 2, MemRows: 3, TempDir: dir, Pool: pool}).
+		Execute(context.Background(), plan)
+	if !errors.Is(err, ErrInsufficientBudget) {
+		t.Fatalf("额度耗尽应返回 ErrInsufficientBudget，得到 %v", err)
+	}
+	st := pool.Stats()
+	if st.InUse != 0 {
+		t.Fatalf("失败后额度应全部归还，仍占用 %d 行", st.InUse)
+	}
+	explained := false
+	for _, ev := range st.Events {
+		if strings.Contains(ev, "耗尽") {
+			explained = true
+		}
+	}
+	if !explained {
+		t.Fatalf("事件应解释额度耗尽原因: %v", st.Events)
+	}
+	if left := spillDirs(t, dir); len(left) != 0 {
+		t.Fatalf("临时目录未清理: %v", left)
+	}
+	// 独立查询用自己的池，不受失败查询影响。
+	a2, b2, c2 := mk()
+	inner2 := NewJoin(NewScan(a2, "a"), NewScan(b2, "b"),
+		Bin(OpEq, Col("a.k"), Col("b.k")), InnerJoin)
+	plan2 := NewJoin(inner2, NewScan(c2, "c"),
+		Bin(OpEq, Col("a.k"), Col("c.k")), InnerJoin)
+	rows, _, err := NewEngine(ExecOptions{BatchRows: 2, MemRows: 4096, TempDir: t.TempDir()}).
+		Execute(context.Background(), plan2)
+	if err != nil {
+		t.Fatalf("独立查询应成功: %v", err)
+	}
+	if len(rows) != 27 {
+		t.Fatalf("独立查询应为 27 行，得到 %d", len(rows))
+	}
+}
+
+// 展示“占用-等待-释放”的对应关系：额度被占满时 AcquireWait 明确等待，
+// 持有者释放后等待者获得额度；取消等待则返回 ctx 错误。
+func TestPoolAcquireWaitBlocksUntilRelease(t *testing.T) {
+	pool := NewMemPool(2)
+	if got := pool.Acquire(2); got != 2 {
+		t.Fatalf("空池应授予 2 行，得到 %d", got)
+	}
+	ctx := context.Background()
+	type result struct {
+		grant int
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		g, err := pool.AcquireWait(ctx, 1)
+		done <- result{g, err}
+	}()
+	// 等待期间不应获得额度。
+	select {
+	case r := <-done:
+		t.Fatalf("额度未释放前不应返回: %+v", r)
+	case <-time.After(50 * time.Millisecond):
+	}
+	st := pool.Stats()
+	if st.InUse != 2 {
+		t.Fatalf("等待期间占用应为 2 行，得到 %d", st.InUse)
+	}
+	pool.Release(2)
+	r := <-done
+	if r.err != nil || r.grant != 1 {
+		t.Fatalf("释放后应获得 1 行额度，得到 %+v", r)
+	}
+	pool.Release(r.grant)
+	st = pool.Stats()
+	if st.InUse != 0 {
+		t.Fatalf("全部释放后占用应为 0，得到 %d", st.InUse)
+	}
+	var waited, granted bool
+	for _, ev := range st.Events {
+		if strings.Contains(ev, "等待") {
+			waited = true
+		}
+		if strings.Contains(ev, "等待结束") {
+			granted = true
+		}
+	}
+	if !waited || !granted {
+		t.Fatalf("事件应记录等待与获得: %v", st.Events)
+	}
+	// 取消中的等待返回 ctx 错误而不是死等。
+	cctx, cancel := context.WithCancel(context.Background())
+	pool.Acquire(2)
+	cancel()
+	if _, err := pool.AcquireWait(cctx, 1); err == nil {
+		t.Fatal("ctx 取消后等待应返回错误")
+	}
+	pool.Release(2)
 }

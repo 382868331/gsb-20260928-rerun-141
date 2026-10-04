@@ -70,14 +70,17 @@ func (e *joinExec) Close() error {
 	return e.r.Close()
 }
 
-// acquire 从共享池申请构建侧额度；无池时退化为完整 MemRows。
-func (e *joinExec) acquire() int {
-	limit := e.opts.MemRows
+// acquireRow 为构建侧常驻的一行申请额度。逐行申请使得每一行常驻
+// 都恰好对应 1 行授予额度，不多占、不漏计；无池时只受 MemRows 上限约束。
+func (e *joinExec) acquireRow() bool {
 	if e.opts.Pool == nil {
-		return limit
+		return true
 	}
-	e.grant = e.opts.Pool.Acquire(limit)
-	return e.grant
+	if e.opts.Pool.Acquire(1) == 0 {
+		return false
+	}
+	e.grant++
+	return true
 }
 
 // MemUsage 报告当前在内存中保留的行数（构建侧物化 + 回读块）。
@@ -97,54 +100,53 @@ func (e *joinExec) prepare(ctx context.Context) error {
 			ErrInsufficientBudget, e.opts.MemRows, e.opts.BatchRows)
 	}
 	leftEq, rightEq := eqJoinKeys(e.on, e.ln)
-	limit := e.acquire()
-	spill := func(probe, build Executor, pending []Tuple, probeEq, buildEq []int, probeLeft bool) {
-		// 构建侧超出授予额度：归还预留，回读阶段只保留 1 行探测块。
-		keep := 1
-		if e.grant < 1 {
-			keep = 0 // 池已耗尽：1 行块作为未计额的最小 I/O 缓冲
-		}
+	// 构建侧超出授予额度而落盘时，回读阶段的探测块是唯一常驻内存的
+	// 连接状态，必须全部来自已授予额度：让出多余保留，只留 1 行
+	// 探测块额度供其他阶段使用；授予 0 行时不允许靠一行未计额缓冲
+	// 硬撑，而是记录原因并返回可解释的预算不足。
+	spill := func(probe, build Executor, pending []Tuple, probeEq, buildEq []int, probeLeft bool) error {
+		memRows := e.opts.MemRows // 无池：MemRows 本身就是预算
 		if e.opts.Pool != nil {
-			e.opts.Pool.Release(e.grant - keep)
+			if e.grant < 1 {
+				e.opts.Pool.NoteSpill(
+					"连接构建侧需落盘，但共享池额度已耗尽（授予 0 行），无法保留探测块")
+				return fmt.Errorf("%w: 共享池额度已耗尽，连接回读需要至少 1 行探测块",
+					ErrInsufficientBudget)
+			}
+			held := e.grant
+			e.opts.Pool.Release(held - 1)
+			e.grant = 1
+			memRows = 1 // 1 行探测块，已计入额度
 			e.opts.Pool.NoteSpill(
-				"连接构建侧超过授予额度 %d 行（池剩余不足），转入临时存储", e.grant)
-		}
-		e.grant = keep
-		memRows := keep
-		if memRows < 1 {
-			memRows = 1
+				"连接构建侧超过授予额度 %d 行（池剩余不足），转入临时存储；回读探测块 %d 行已计入额度",
+				held, memRows)
 		}
 		e.inner = newHashJoinSpill(probe, build, pending, e.on, e.jt, e.ln, e.rn,
 			probeEq, buildEq, probeLeft, e.opts, memRows)
+		return nil
 	}
 	mem := func(probe Executor, rows []Tuple, probeEq, buildEq []int, probeLeft bool) {
-		// 实际持有 len(rows)，归还多余预留。
-		if e.opts.Pool != nil && len(rows) < e.grant {
-			e.opts.Pool.Release(e.grant - len(rows))
-			e.grant = len(rows)
-		}
+		// 逐行申请保证 grant == len(rows)，无需事后找平。
 		e.inner = newMemHashJoin(probe, rows, e.on, e.jt, e.ln, e.rn,
 			probeEq, buildEq, probeLeft, e.opts.BatchRows)
 	}
 	if e.jt == LeftJoin {
-		b, err := collectLimited(ctx, e.r, limit)
+		b, err := e.collectBuild(ctx, e.r)
 		if err != nil {
 			return err
 		}
 		if b.spilled {
-			spill(e.l, e.r, b.pending, leftEq, rightEq, true)
-			return nil
+			return spill(e.l, e.r, b.pending, leftEq, rightEq, true)
 		}
 		mem(e.l, b.rows, leftEq, rightEq, true)
 		return nil
 	}
-	b, err := collectLimited(ctx, e.l, limit)
+	b, err := e.collectBuild(ctx, e.l)
 	if err != nil {
 		return err
 	}
 	if b.spilled {
-		spill(e.r, e.l, b.pending, rightEq, leftEq, false)
-		return nil
+		return spill(e.r, e.l, b.pending, rightEq, leftEq, false)
 	}
 	mem(e.r, b.rows, rightEq, leftEq, false)
 	return nil
@@ -173,7 +175,10 @@ type collected struct {
 	spilled bool
 }
 
-func collectLimited(ctx context.Context, src Executor, limit int) (*collected, error) {
+// collectBuild 逐行收集构建侧：每一行常驻都先取得 Pool 额度（且不超过
+// MemRows 上限）。额度耗尽即转入落盘模式：已收集行与后续行全部交给
+// 落盘路径（pending + 继续读 src），不会靠未计额的行维持推进。
+func (e *joinExec) collectBuild(ctx context.Context, src Executor) (*collected, error) {
 	c := &collected{}
 	for {
 		if err := ctx.Err(); err != nil {
@@ -186,10 +191,16 @@ func collectLimited(ctx context.Context, src Executor, limit int) (*collected, e
 		if err != nil {
 			return nil, err
 		}
-		c.rows = append(c.rows, b.Rows...)
-		if len(c.rows) > limit {
+		for i, row := range b.Rows {
+			if len(c.rows) < e.opts.MemRows && e.acquireRow() {
+				c.rows = append(c.rows, row)
+				continue
+			}
+			// 额度耗尽：已收集行与本批剩余行作为落盘首批，
+			// 后续输入由落盘路径流式读取，不在内存中堆积。
 			c.spilled = true
-			c.pending = c.rows
+			c.pending = append(c.pending, c.rows...)
+			c.pending = append(c.pending, b.Rows[i:]...)
 			c.rows = nil
 			return c, nil
 		}

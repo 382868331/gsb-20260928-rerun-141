@@ -25,15 +25,16 @@ type hashJoinSpill struct {
 	partCount int
 	curPart   int
 
-	// 回读状态：探测侧按 MemRows 分块驻留内存，构建侧按落盘批次流式重扫，
-	// 因此热键（单侧分片极大）也不会突破内存预算。
+	// 回读状态：探测侧按 memRows（= Pool 授予额度）分块驻留内存，是唯一
+	// 常驻的连接状态；构建侧分片按落盘块（<= BatchRows 行）流式重扫，
+	// 扫描缓冲与管道批次一样受 BatchRows 约束。因此热键（单侧分片极大）
+	// 也不会突破内存预算，且每一行驻留都能对应到某一条额度规则。
 	openPart  int
 	partOpen  bool
 	probeR    *partitionReader
-	probeBuf  []Tuple
-	probeEOF  bool
 	probeBlk  []Tuple
 	matched   []bool
+	probePos  int
 	buildR    *partitionReader
 	buildChk  []Tuple
 	buildPos  int
@@ -56,9 +57,10 @@ func newHashJoinSpill(probe, build Executor, pending []Tuple, on Expr, jt JoinTy
 		probeLeft: probeLeft, opts: opts, partCount: parts, memRows: memRows}
 }
 
-// MemUsage 报告当前内存占用：驻留的探测块（<= memRows）加缓冲中的行。
+// MemUsage 报告当前内存占用：驻留的探测块（<= memRows，已计入 Pool 额度）
+// 加构建侧流式扫描缓冲（<= BatchRows）。
 func (e *hashJoinSpill) MemUsage() int {
-	return len(e.probeBlk) + len(e.probeBuf) + len(e.buildChk)
+	return len(e.probeBlk) + len(e.buildChk)
 }
 
 func (e *hashJoinSpill) partBuild(p int) int { return p }
@@ -71,8 +73,15 @@ func (e *hashJoinSpill) Close() error {
 	return e.spill.cleanup()
 }
 
+// writeSide 把一侧输入按连接键哈希写入分片。chunkRows 限制单个落盘块的
+// 行数，从而限制回读时单个解码块在内存中的行数：探测侧块就是回读时的
+// 驻留块（<= memRows，计入 Pool 额度），构建侧块是流式扫描缓冲
+// （<= BatchRows，与管道批次同一约束）。
 func (e *hashJoinSpill) writeSide(ctx context.Context, src Executor, rows []Tuple,
-	keyIdx []int, partOffset func(int) int) error {
+	keyIdx []int, partOffset func(int) int, chunkRows int) error {
+	if chunkRows < 1 {
+		chunkRows = 1
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -100,10 +109,15 @@ func (e *hashJoinSpill) writeSide(ctx context.Context, src Executor, rows []Tupl
 			bufs[p] = append(bufs[p], row)
 		}
 		for p, rs := range bufs {
-			if len(rs) > 0 {
-				if err := e.spill.write(partOffset(p), rs); err != nil {
+			for len(rs) > 0 {
+				n := chunkRows
+				if n > len(rs) {
+					n = len(rs)
+				}
+				if err := e.spill.write(partOffset(p), rs[:n]); err != nil {
 					return err
 				}
+				rs = rs[n:]
 			}
 		}
 	}
@@ -119,11 +133,11 @@ func (e *hashJoinSpill) prepare(ctx context.Context) error {
 		return err
 	}
 	e.spill = s
-	if err := e.writeSide(ctx, e.build, e.pendingBuild, e.buildEq, e.partBuild); err != nil {
+	if err := e.writeSide(ctx, e.build, e.pendingBuild, e.buildEq, e.partBuild, e.opts.BatchRows); err != nil {
 		_ = s.cleanup()
 		return err
 	}
-	if err := e.writeSide(ctx, e.probe, nil, e.probeEq, e.partProbe); err != nil {
+	if err := e.writeSide(ctx, e.probe, nil, e.probeEq, e.partProbe, e.memRows); err != nil {
 		_ = s.cleanup()
 		return err
 	}
@@ -144,10 +158,9 @@ func (e *hashJoinSpill) unmatched(probe Tuple) Tuple {
 	return append(append(Tuple{}, nullRow(e.ln)...), probe...)
 }
 
-// nextBlock 载入下一块探测侧行（至多 MemRows 行），必要时前进到下一个分片。
-// 返回 false 表示所有分片都已耗尽。
+// nextBlock 载入下一块探测侧行（一个落盘块，至多 memRows 行，全部来自
+// Pool 授予额度），必要时前进到下一个分片。返回 false 表示所有分片都已耗尽。
 func (e *hashJoinSpill) nextBlock(ctx context.Context) (bool, error) {
-	limit := e.memRows
 	for {
 		if err := ctx.Err(); err != nil {
 			return false, err
@@ -161,38 +174,26 @@ func (e *hashJoinSpill) nextBlock(ctx context.Context) (bool, error) {
 				return false, err
 			}
 			e.probeR = pr
-			e.probeBuf = e.probeBuf[:0]
-			e.probeEOF = false
 			e.openPart = e.curPart
 			e.curPart++
 			e.partOpen = true
 		}
-		for len(e.probeBuf) < limit && !e.probeEOF {
-			chunk, err := e.probeR.next()
-			if errors.Is(err, io.EOF) {
-				e.probeEOF = true
-				break
-			}
-			if err != nil {
-				return false, err
-			}
-			e.probeBuf = append(e.probeBuf, chunk...)
-		}
-		if len(e.probeBuf) == 0 {
-			// 当前分片探测侧为空，推进到下一分片。
+		chunk, err := e.probeR.next()
+		if errors.Is(err, io.EOF) {
+			// 当前分片探测侧已耗尽，推进到下一分片。
 			e.partOpen = false
 			e.probeR = nil
 			continue
 		}
-		n := limit
-		if n > len(e.probeBuf) {
-			n = len(e.probeBuf)
+		if err != nil {
+			return false, err
 		}
-		blk := make([]Tuple, n)
-		copy(blk, e.probeBuf[:n])
-		e.probeBuf = append(e.probeBuf[:0], e.probeBuf[n:]...)
-		e.probeBlk = blk
-		e.matched = make([]bool, n)
+		if len(chunk) == 0 {
+			continue
+		}
+		e.probeBlk = chunk
+		e.matched = make([]bool, len(chunk))
+		e.probePos = 0
 		br, err := e.spill.reader(e.partBuild(e.openPart))
 		if err != nil {
 			return false, err
@@ -275,9 +276,14 @@ func (e *hashJoinSpill) Next(ctx context.Context) (*Batch, error) {
 					continue
 				}
 			}
+			// 当前构建行要与块内每一行探测行比较；批满返回时
+			// probePos 记录进度，buildPos 暂不前进，下一批继续，
+			// 保证跨批边界不漏匹配。
 			build := e.buildChk[e.buildPos]
-			e.buildPos++
-			for i, probe := range e.probeBlk {
+			for e.probePos < len(e.probeBlk) && len(out.Rows) < sz {
+				i := e.probePos
+				e.probePos++
+				probe := e.probeBlk[i]
 				combined := e.combine(probe, build)
 				v, err := e.on.Eval(combined)
 				if err != nil {
@@ -286,10 +292,11 @@ func (e *hashJoinSpill) Next(ctx context.Context) (*Batch, error) {
 				if v.IsTruthy() {
 					e.matched[i] = true
 					out.Rows = append(out.Rows, combined)
-					if len(out.Rows) >= sz {
-						return out, nil
-					}
 				}
+			}
+			if e.probePos >= len(e.probeBlk) {
+				e.buildPos++
+				e.probePos = 0
 			}
 			continue
 		}

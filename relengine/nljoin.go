@@ -19,7 +19,6 @@ type nestedLoopJoin struct {
 	opts   ExecOptions
 
 	loaded    bool
-	limit     int // 右侧允许驻留内存的行数（Pool 授予额度）
 	grant     int
 	rightRows []Tuple
 	spill     *spiller
@@ -30,7 +29,6 @@ type nestedLoopJoin struct {
 	left      Tuple
 	rightPos  int
 	diskDone  bool
-	diskBuf   []Tuple
 	matched   int
 }
 
@@ -69,11 +67,6 @@ func (e *nestedLoopJoin) loadRight(ctx context.Context) error {
 		return fmt.Errorf("%w: MemRows=%d BatchRows=%d",
 			ErrInsufficientBudget, e.opts.MemRows, e.opts.BatchRows)
 	}
-	e.limit = e.opts.MemRows
-	if e.opts.Pool != nil {
-		e.grant = e.opts.Pool.Acquire(e.opts.MemRows)
-		e.limit = e.grant
-	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -81,18 +74,15 @@ func (e *nestedLoopJoin) loadRight(ctx context.Context) error {
 		b, err := e.r.Next(ctx)
 		if errors.Is(err, io.EOF) {
 			e.loaded = true
-			// 实际持有 len(rightRows)，归还多余预留。
-			if e.opts.Pool != nil && len(e.rightRows) < e.grant {
-				e.opts.Pool.Release(e.grant - len(e.rightRows))
-				e.grant = len(e.rightRows)
-			}
 			return nil
 		}
 		if err != nil {
 			return err
 		}
 		for _, row := range b.Rows {
-			if len(e.rightRows) < e.limit {
+			// 逐行申请额度：每一行右侧驻留都恰好对应 1 行授予额度；
+			// 额度耗尽的行直接落盘，不靠未计额缓冲硬撑。
+			if len(e.rightRows) < e.opts.MemRows && e.acquireRow() {
 				e.rightRows = append(e.rightRows, row)
 				continue
 			}
@@ -101,6 +91,18 @@ func (e *nestedLoopJoin) loadRight(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// acquireRow 为右侧驻留的一行申请额度；无池时只受 MemRows 上限约束。
+func (e *nestedLoopJoin) acquireRow() bool {
+	if e.opts.Pool == nil {
+		return true
+	}
+	if e.opts.Pool.Acquire(1) == 0 {
+		return false
+	}
+	e.grant++
+	return true
 }
 
 // spillRow 把放不进内存预算的右侧行写入单片临时文件。
@@ -113,13 +115,15 @@ func (e *nestedLoopJoin) spillRow(row Tuple) error {
 		e.spill = s
 		if e.opts.Pool != nil {
 			e.opts.Pool.NoteSpill(
-				"嵌套循环连接右侧超过授予额度 %d 行（池剩余不足），转入临时存储", e.limit)
+				"嵌套循环连接右侧驻留 %d 行后池额度耗尽，剩余行转入临时存储", len(e.rightRows))
 		}
 	}
 	return e.spill.write(0, []Tuple{row})
 }
 
 // nextDiskRow 从落盘部分读出下一行；ok=false 表示落盘部分已扫完。
+// 落盘块固定为单行（见 spillRow），解码出的行立即参与比较、不留存，
+// 因此落盘侧没有任何常驻内存缓冲需要计入额度。
 func (e *nestedLoopJoin) nextDiskRow() (Tuple, bool, error) {
 	if e.spill == nil {
 		return nil, false, nil
@@ -141,12 +145,7 @@ func (e *nestedLoopJoin) nextDiskRow() (Tuple, bool, error) {
 			return nil, false, err
 		}
 		if len(chunk) > 0 {
-			row := chunk[0]
-			if len(chunk) > 1 {
-				// 同一块内剩余行暂存回内存队列，避免重解码。
-				e.diskBuf = append(e.diskBuf[:0], chunk[1:]...)
-			}
-			return row, true, nil
+			return chunk[0], true, nil
 		}
 	}
 }
@@ -199,15 +198,9 @@ func (e *nestedLoopJoin) Next(ctx context.Context) (*Batch, error) {
 			var right Tuple
 			var ok bool
 			var err error
-			if len(e.diskBuf) > 0 {
-				right = e.diskBuf[0]
-				e.diskBuf = e.diskBuf[1:]
-				ok = true
-			} else {
-				right, ok, err = e.nextDiskRow()
-				if err != nil {
-					return nil, err
-				}
+			right, ok, err = e.nextDiskRow()
+			if err != nil {
+				return nil, err
 			}
 			if !ok {
 				e.diskDone = true
