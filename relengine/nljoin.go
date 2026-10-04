@@ -70,10 +70,6 @@ func (e *nestedLoopJoin) loadRight(ctx context.Context) error {
 			ErrInsufficientBudget, e.opts.MemRows, e.opts.BatchRows)
 	}
 	e.limit = e.opts.MemRows
-	if e.opts.Pool != nil {
-		e.grant = e.opts.Pool.Acquire(e.opts.MemRows)
-		e.limit = e.grant
-	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -81,7 +77,7 @@ func (e *nestedLoopJoin) loadRight(ctx context.Context) error {
 		b, err := e.r.Next(ctx)
 		if errors.Is(err, io.EOF) {
 			e.loaded = true
-			// 实际持有 len(rightRows)，归还多余预留。
+			// 实际持有 len(rightRows)，归还多余预留（增量申请下通常相等）。
 			if e.opts.Pool != nil && len(e.rightRows) < e.grant {
 				e.opts.Pool.Release(e.grant - len(e.rightRows))
 				e.grant = len(e.rightRows)
@@ -90,6 +86,24 @@ func (e *nestedLoopJoin) loadRight(ctx context.Context) error {
 		}
 		if err != nil {
 			return err
+		}
+		if e.opts.Pool != nil {
+			// 按批增量申请：只有拿到额度的行留在内存，其余直接落盘；
+			// 不在收到行之前空占预留，嵌套/并行阶段可先用剩余额度。
+			rows := b.Rows
+			want := e.limit - e.grant
+			if want > len(rows) {
+				want = len(rows)
+			}
+			g := e.opts.Pool.Acquire(want)
+			e.grant += g
+			e.rightRows = append(e.rightRows, rows[:g]...)
+			for _, row := range rows[g:] {
+				if err := e.spillRow(row); err != nil {
+					return err
+				}
+			}
+			continue
 		}
 		for _, row := range b.Rows {
 			if len(e.rightRows) < e.limit {

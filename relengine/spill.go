@@ -57,6 +57,8 @@ func newHashJoinSpill(probe, build Executor, pending []Tuple, on Expr, jt JoinTy
 }
 
 // MemUsage 报告当前内存占用：驻留的探测块（<= memRows）加缓冲中的行。
+// 落盘写入按 memRows 切块，因此回读时探测块与构建扫描块各自都不超过
+// memRows 行，实际驻留总量不超过 2 倍授予额度（探测块 + 当前构建扫描块）。
 func (e *hashJoinSpill) MemUsage() int {
 	return len(e.probeBlk) + len(e.probeBuf) + len(e.buildChk)
 }
@@ -71,8 +73,24 @@ func (e *hashJoinSpill) Close() error {
 	return e.spill.cleanup()
 }
 
+// writeSide 把一侧按连接键哈希分片写出；同一分片内按 chunk 行切块，
+// 使回读时每次解码的块不超过 chunk 行，读缓冲不随输入批大小膨胀。
 func (e *hashJoinSpill) writeSide(ctx context.Context, src Executor, rows []Tuple,
-	keyIdx []int, partOffset func(int) int) error {
+	keyIdx []int, partOffset func(int) int, chunk int) error {
+	if chunk < 1 {
+		chunk = 1
+	}
+	bufs := make([][]Tuple, e.partCount)
+	flush := func(p int) error {
+		if len(bufs[p]) == 0 {
+			return nil
+		}
+		if err := e.spill.write(partOffset(p), bufs[p]); err != nil {
+			return err
+		}
+		bufs[p] = nil
+		return nil
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -84,29 +102,32 @@ func (e *hashJoinSpill) writeSide(ctx context.Context, src Executor, rows []Tupl
 		} else {
 			b, err := src.Next(ctx)
 			if errors.Is(err, io.EOF) {
-				return nil
+				break
 			}
 			if err != nil {
 				return err
 			}
 			batch = b.Rows
 		}
-		bufs := make([][]Tuple, e.partCount)
 		for _, row := range batch {
 			p := 0
 			if len(keyIdx) > 0 {
 				p = int(keyHash(row, keyIdx) % uint64(e.partCount))
 			}
 			bufs[p] = append(bufs[p], row)
-		}
-		for p, rs := range bufs {
-			if len(rs) > 0 {
-				if err := e.spill.write(partOffset(p), rs); err != nil {
+			if len(bufs[p]) >= chunk {
+				if err := flush(p); err != nil {
 					return err
 				}
 			}
 		}
 	}
+	for p := range bufs {
+		if err := flush(p); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (e *hashJoinSpill) prepare(ctx context.Context) error {
@@ -119,11 +140,11 @@ func (e *hashJoinSpill) prepare(ctx context.Context) error {
 		return err
 	}
 	e.spill = s
-	if err := e.writeSide(ctx, e.build, e.pendingBuild, e.buildEq, e.partBuild); err != nil {
+	if err := e.writeSide(ctx, e.build, e.pendingBuild, e.buildEq, e.partBuild, e.memRows); err != nil {
 		_ = s.cleanup()
 		return err
 	}
-	if err := e.writeSide(ctx, e.probe, nil, e.probeEq, e.partProbe); err != nil {
+	if err := e.writeSide(ctx, e.probe, nil, e.probeEq, e.partProbe, e.memRows); err != nil {
 		_ = s.cleanup()
 		return err
 	}

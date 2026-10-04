@@ -70,16 +70,6 @@ func (e *joinExec) Close() error {
 	return e.r.Close()
 }
 
-// acquire 从共享池申请构建侧额度；无池时退化为完整 MemRows。
-func (e *joinExec) acquire() int {
-	limit := e.opts.MemRows
-	if e.opts.Pool == nil {
-		return limit
-	}
-	e.grant = e.opts.Pool.Acquire(limit)
-	return e.grant
-}
-
 // MemUsage 报告当前在内存中保留的行数（构建侧物化 + 回读块）。
 func (e *joinExec) MemUsage() int {
 	switch in := e.inner.(type) {
@@ -97,28 +87,32 @@ func (e *joinExec) prepare(ctx context.Context) error {
 			ErrInsufficientBudget, e.opts.MemRows, e.opts.BatchRows)
 	}
 	leftEq, rightEq := eqJoinKeys(e.on, e.ln)
-	limit := e.acquire()
-	spill := func(probe, build Executor, pending []Tuple, probeEq, buildEq []int, probeLeft bool) {
-		// 构建侧超出授予额度：归还预留，回读阶段只保留 1 行探测块。
+	spill := func(probe, build Executor, pending []Tuple, probeEq, buildEq []int, probeLeft bool) error {
+		// 回读阶段必须在内存驻留一个探测块（至少 1 行），这行缓冲同样计入额度：
+		// 先归还多余预留，再确保保留 keep 行；池剩余连 1 行都给不出时，
+		// 明确返回预算不足，而不是保留一行未计额的缓冲继续推进。
 		keep := 1
-		if e.grant < 1 {
-			keep = 0 // 池已耗尽：1 行块作为未计额的最小 I/O 缓冲
-		}
 		if e.opts.Pool != nil {
-			e.opts.Pool.Release(e.grant - keep)
+			if e.grant < keep {
+				e.grant += e.opts.Pool.Acquire(keep - e.grant)
+			}
+			if e.grant < keep {
+				return fmt.Errorf("%w: 连接回读需要 %d 行探测缓冲，共享池剩余额度为 0",
+					ErrInsufficientBudget, keep)
+			}
+			if e.grant > keep {
+				e.opts.Pool.Release(e.grant - keep)
+			}
+			e.grant = keep
 			e.opts.Pool.NoteSpill(
-				"连接构建侧超过授予额度 %d 行（池剩余不足），转入临时存储", e.grant)
-		}
-		e.grant = keep
-		memRows := keep
-		if memRows < 1 {
-			memRows = 1
+				"连接构建侧超过授予额度（池剩余不足），转入临时存储；回读探测块保留 %d 行额度", keep)
 		}
 		e.inner = newHashJoinSpill(probe, build, pending, e.on, e.jt, e.ln, e.rn,
-			probeEq, buildEq, probeLeft, e.opts, memRows)
+			probeEq, buildEq, probeLeft, e.opts, keep)
+		return nil
 	}
 	mem := func(probe Executor, rows []Tuple, probeEq, buildEq []int, probeLeft bool) {
-		// 实际持有 len(rows)，归还多余预留。
+		// 实际持有 len(rows)，归还多余预留（增量申请下通常相等）。
 		if e.opts.Pool != nil && len(rows) < e.grant {
 			e.opts.Pool.Release(e.grant - len(rows))
 			e.grant = len(rows)
@@ -127,24 +121,22 @@ func (e *joinExec) prepare(ctx context.Context) error {
 			probeEq, buildEq, probeLeft, e.opts.BatchRows)
 	}
 	if e.jt == LeftJoin {
-		b, err := collectLimited(ctx, e.r, limit)
+		b, err := e.collectBuild(ctx, e.r)
 		if err != nil {
 			return err
 		}
 		if b.spilled {
-			spill(e.l, e.r, b.pending, leftEq, rightEq, true)
-			return nil
+			return spill(e.l, e.r, b.pending, leftEq, rightEq, true)
 		}
 		mem(e.l, b.rows, leftEq, rightEq, true)
 		return nil
 	}
-	b, err := collectLimited(ctx, e.l, limit)
+	b, err := e.collectBuild(ctx, e.l)
 	if err != nil {
 		return err
 	}
 	if b.spilled {
-		spill(e.r, e.l, b.pending, rightEq, leftEq, false)
-		return nil
+		return spill(e.r, e.l, b.pending, rightEq, leftEq, false)
 	}
 	mem(e.r, b.rows, rightEq, leftEq, false)
 	return nil
@@ -173,7 +165,11 @@ type collected struct {
 	spilled bool
 }
 
-func collectLimited(ctx context.Context, src Executor, limit int) (*collected, error) {
+// collectBuild 逐批拉取构建侧，并按批向共享池申请额度：只有真正拿到额度的行
+// 才留在内存，拿不到额度的行直接转入待落盘部分。这样嵌套连接在尚未收到
+// 任何行之前不会空占预留，下层连接可以先申请到额度；上层随后按剩余额度
+// 申请，不足即落盘。池为空时退化为 MemRows 上限。
+func (e *joinExec) collectBuild(ctx context.Context, src Executor) (*collected, error) {
 	c := &collected{}
 	for {
 		if err := ctx.Err(); err != nil {
@@ -186,8 +182,26 @@ func collectLimited(ctx context.Context, src Executor, limit int) (*collected, e
 		if err != nil {
 			return nil, err
 		}
-		c.rows = append(c.rows, b.Rows...)
-		if len(c.rows) > limit {
+		rows := b.Rows
+		if e.opts.Pool != nil {
+			want := e.opts.MemRows - e.grant
+			if want > len(rows) {
+				want = len(rows)
+			}
+			g := e.opts.Pool.Acquire(want)
+			e.grant += g
+			c.rows = append(c.rows, rows[:g]...)
+			if g < len(rows) {
+				c.spilled = true
+				c.pending = append(c.pending, c.rows...)
+				c.pending = append(c.pending, rows[g:]...)
+				c.rows = nil
+				return c, nil
+			}
+			continue
+		}
+		c.rows = append(c.rows, rows...)
+		if len(c.rows) > e.opts.MemRows {
 			c.spilled = true
 			c.pending = c.rows
 			c.rows = nil
