@@ -24,6 +24,11 @@ type ExecOptions struct {
 	BatchRows int    // 每批行数上限（>0）
 	MemRows   int    // 单个“需要全量输入”的算子允许在内存保留的行数上限（>0）
 	TempDir   string // 落盘目录；为空时用 os.TempDir
+	// Pool 是可选的共享内存额度池。非空时，同一查询中的多个连接算子
+	// 从同一份额度中记账：某个阶段多占时，其他阶段等待或转入临时存储，
+	// 不会各自把整份 MemRows 重复计算。为空时 Engine 为每次 Execute
+	// 创建容量为 MemRows 的独立池，不同查询互不影响。
+	Pool *MemManager
 	// SpillAggregate 强制分组聚合走“分片落盘 -> 逐片聚合”的受限内存路径。
 	// Join 会根据右/左构建侧实际行数自动选择是否落盘。
 	SpillAggregate bool

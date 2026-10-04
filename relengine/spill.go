@@ -32,6 +32,8 @@ type hashJoinSpill struct {
 	probeBuf  []Tuple
 	probeEOF  bool
 	probeBlk  []Tuple
+	blkGrant  *Grant
+	probePos  int
 	matched   []bool
 	buildR    *partitionReader
 	buildChk  []Tuple
@@ -56,10 +58,35 @@ func (e *hashJoinSpill) partBuild(p int) int { return p }
 func (e *hashJoinSpill) partProbe(p int) int { return e.partCount + p }
 
 func (e *hashJoinSpill) Close() error {
+	if e.blkGrant != nil {
+		e.blkGrant.Release()
+		e.blkGrant = nil
+	}
 	if e.spill == nil {
 		return nil
 	}
 	return e.spill.cleanup()
+}
+
+// blockLimit 决定下一块探测侧驻留行数：不超过 MemRows；共享池紧张时
+// 主动缩小块（最少 1 行），而不是占用别人的额度或重复计算。
+func (e *hashJoinSpill) blockLimit() int {
+	limit := e.opts.MemRows
+	pool := e.opts.Pool
+	if pool == nil {
+		return limit
+	}
+	for n := limit; n >= 1; n-- {
+		if g := pool.TryAcquire(n, "join-probe-block"); g != nil {
+			e.blkGrant = g
+			return n
+		}
+	}
+	// 连 1 行额度都暂时拿不到：以 1 行下限继续（不计账，有界），
+	// 并记录等待原因，避免在拉取流水线中互相等待造成死锁。
+	pool.NoteWait("join-probe-block", 1,
+		"共享内存额度被其他阶段占用，探测块以 1 行下限继续（未占用额度）")
+	return 1
 }
 
 func (e *hashJoinSpill) writeSide(ctx context.Context, src Executor, rows []Tuple,
@@ -138,7 +165,11 @@ func (e *hashJoinSpill) unmatched(probe Tuple) Tuple {
 // nextBlock 载入下一块探测侧行（至多 MemRows 行），必要时前进到下一个分片。
 // 返回 false 表示所有分片都已耗尽。
 func (e *hashJoinSpill) nextBlock(ctx context.Context) (bool, error) {
-	limit := e.opts.MemRows
+	if e.blkGrant != nil {
+		e.blkGrant.Release()
+		e.blkGrant = nil
+	}
+	limit := e.blockLimit()
 	for {
 		if err := ctx.Err(); err != nil {
 			return false, err
@@ -183,6 +214,7 @@ func (e *hashJoinSpill) nextBlock(ctx context.Context) (bool, error) {
 		copy(blk, e.probeBuf[:n])
 		e.probeBuf = append(e.probeBuf[:0], e.probeBuf[n:]...)
 		e.probeBlk = blk
+		e.probePos = 0
 		e.matched = make([]bool, n)
 		br, err := e.spill.reader(e.partBuild(e.openPart))
 		if err != nil {
@@ -267,8 +299,12 @@ func (e *hashJoinSpill) Next(ctx context.Context) (*Batch, error) {
 				}
 			}
 			build := e.buildChk[e.buildPos]
-			e.buildPos++
-			for i, probe := range e.probeBlk {
+			// 块内探测行下标必须跨 Next 调用保存：批满返回后下次从
+			// 断点继续，否则每个构建行只匹配到部分探测行（丢结果）。
+			for e.probePos < len(e.probeBlk) {
+				i := e.probePos
+				probe := e.probeBlk[i]
+				e.probePos++
 				combined := e.combine(probe, build)
 				v, err := e.on.Eval(combined)
 				if err != nil {
@@ -281,6 +317,10 @@ func (e *hashJoinSpill) Next(ctx context.Context) (*Batch, error) {
 						return out, nil
 					}
 				}
+			}
+			if e.probePos >= len(e.probeBlk) {
+				e.probePos = 0
+				e.buildPos++
 			}
 			continue
 		}
